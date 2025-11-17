@@ -1,0 +1,26 @@
+## 🎯 Usage
+
+### Using the Pre-trained Model
+```python
+import torch
+import numpy as np
+from ML_4_fraud import FraudMLP  # Import the model architecture
+
+# Load saved model and scaler
+model = FraudMLP(29)  # 29 input features
+model.load_state_dict(torch.load("fraud_model.pt"))
+
+# Load scaler parameters
+scaler_mean = np.load("scaler_mean.npy")
+scaler_scale = np.load("scaler_scale.npy")
+
+# Preprocess new data
+def preprocess_data(X_new):
+    return (X_new - scaler_mean) / scaler_scale
+
+# Make predictions
+def predict_fraud(X_new):
+    X_scaled = preprocess_data(X_new)
+    with torch.no_grad():
+        probabilities = model(torch.from_numpy(X_scaled).float())
+    return probabilities.numpy()
