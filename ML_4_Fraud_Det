@@ -1,0 +1,203 @@
+# FRAUD CLASSIFICATION PIPELINE — FULL VERSION
+# Deep MLP + class weighting + early stopping
+# Works with ARFF datasets like Credit Card Fraud
+# ------------------------------------------------
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.io import arff
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, roc_curve
+)
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import copy
+
+# CONFIG
+DATA_FILE = r"C:<your_path_here>\dataset.arff"
+RESULTS_DIR = Path("fraud_results")
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+TEST_SIZE = 0.20
+VAL_SIZE = 0.15
+
+EPOCHS = 150
+BATCH_SIZE = 256
+PATIENCE = 10
+LR = 1e-3
+SEED = 123
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+
+# LOAD DATASET
+raw, meta = arff.loadarff(DATA_FILE)
+df = pd.DataFrame(raw)
+
+# fix byte-string label column
+df["class"] = df["class"].apply(lambda x: 1 if x == b"fraud" else 0)
+
+y_full = df["class"].astype(np.float32).values
+X_full = df.drop(columns=["class"]).astype(np.float32).values
+
+# TRAIN-VAL-TEST SPLIT
+X_trv, X_test, y_trv, y_test = train_test_split(
+    X_full, y_full, test_size=TEST_SIZE, random_state=SEED, stratify=y_full
+)
+
+val_frac = VAL_SIZE / (1 - TEST_SIZE)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trv, y_trv, test_size=val_frac, random_state=SEED, stratify=y_trv
+)
+
+# SCALING
+scaler = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train)
+X_val_sc = scaler.transform(X_val)
+X_test_sc = scaler.transform(X_test)
+
+# TORCH DATASETS
+train_ds = TensorDataset(
+    torch.from_numpy(X_train_sc).float(),
+    torch.from_numpy(y_train).float().view(-1, 1)
+)
+val_ds = TensorDataset(
+    torch.from_numpy(X_val_sc).float(),
+    torch.from_numpy(y_val).float().view(-1, 1)
+)
+test_ds = TensorDataset(
+    torch.from_numpy(X_test_sc).float(),
+    torch.from_numpy(y_test).float().view(-1, 1)
+)
+
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+# CLASS WEIGHTING (important for fraud imbalance)
+fraud_ratio = y_train.mean()
+# minority class gets more weight
+weight = torch.tensor([1 - fraud_ratio]).float()
+
+criterion = nn.BCELoss(weight=weight)
+
+# MODEL — deep MLP
+class FraudMLP(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+model = FraudMLP(X_train_sc.shape[1])
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+# TRAINING LOOP — with early stopping
+best_state = copy.deepcopy(model.state_dict())
+best_val_loss = float("inf")
+counter = 0
+train_losses = []
+val_losses = []
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0.0
+
+    for xb, yb in train_dl:
+        optimizer.zero_grad()
+        preds = model(xb)
+        loss = criterion(preds, yb)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * xb.size(0)
+
+    train_loss = running_loss / len(train_dl.dataset)
+    train_losses.append(train_loss)
+
+    # validation
+    model.eval()
+    with torch.no_grad():
+        val_preds = model(torch.from_numpy(X_val_sc).float())
+        val_loss = criterion(val_preds, torch.from_numpy(
+            y_val).float().view(-1, 1)).item()
+    val_losses.append(val_loss)
+
+    print(
+        f"Epoch {epoch}: Train Loss = {train_loss:.4f} | Val Loss = {val_loss:.4f}")
+
+    # early stopping
+    if val_loss < best_val_loss - 1e-6:
+        best_val_loss = val_loss
+        best_state = copy.deepcopy(model.state_dict())
+        counter = 0
+    else:
+        counter += 1
+        if counter >= PATIENCE:
+            print("Early stopping triggered.")
+            break
+
+# reload best state
+model.load_state_dict(best_state)
+
+# PREDICTION
+model.eval()
+with torch.no_grad():
+    test_probs = model(torch.from_numpy(X_test_sc).float()).squeeze().numpy()
+
+test_preds = (test_probs >= 0.5).astype(int)
+
+# METRICS
+metrics = {
+    "precision": precision_score(y_test, test_preds),
+    "recall": recall_score(y_test, test_preds),
+    "f1": f1_score(y_test, test_preds),
+    "roc_auc": roc_auc_score(y_test, test_probs)
+}
+
+print("\n===== FINAL METRICS =====")
+for k, v in metrics.items():
+    print(f"{k.upper()}: {v:.4f}")
+
+# confusion matrix
+cm = confusion_matrix(y_test, test_preds)
+print("\nConfusion matrix:")
+print(cm)
+
+# ROC CURVE
+fpr, tpr, _ = roc_curve(y_test, test_probs)
+plt.figure(figsize=(6, 6))
+plt.plot(fpr, tpr, label=f"ROC AUC = {metrics['roc_auc']:.3f}")
+plt.plot([0, 1], [0, 1], "--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve")
+plt.legend()
+plt.tight_layout()
+plt.savefig(RESULTS_DIR / "roc_curve.png")
+plt.close()
+
+# SAVE MODEL + SCALER
+torch.save(model.state_dict(), RESULTS_DIR / "fraud_model.pt")
+np.save(RESULTS_DIR / "scaler_mean.npy", scaler.mean_)
+np.save(RESULTS_DIR / "scaler_scale.npy", scaler.scale_)
+
+print("Saved model + scaler.")
